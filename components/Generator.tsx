@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { STRINGS, VIDEO_RESOLUTIONS, DEFAULT_VIDEO_RESOLUTION, THUMBNAIL_STYLES, DEFAULT_THUMBNAIL_STYLE } from '../constants';
 import { generateScript, generateThumbnail, generateVeoVideo, generateVoiceover } from '../services/geminiService';
 import { GeneratedAsset, GenerationStep, Project } from '../types';
+import { getHistory, saveProject } from '../services/storageService';
 import AssetCard from './AssetCard';
 
 const Generator: React.FC = () => {
@@ -26,22 +27,30 @@ const Generator: React.FC = () => {
 
   const addLog = (msg: string) => setLogs(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev]);
 
-  // Load History
+  // Load History from IndexedDB
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem('domination_history');
-      if (saved) {
-        setHistory(JSON.parse(saved));
-      }
-    } catch (e) {
-      console.error("Failed to load history", e);
-    }
+    const load = async () => {
+        try {
+            const h = await getHistory();
+            setHistory(h);
+        } catch (e) {
+            console.error("Failed to load history", e);
+            addLog("ERROR: HISTORY DATABASE UNAVAILABLE");
+        }
+    };
+    load();
   }, []);
 
-  const saveProjectToHistory = (newProject: Project) => {
-    const updated = [newProject, ...history];
-    setHistory(updated);
-    localStorage.setItem('domination_history', JSON.stringify(updated));
+  const saveProjectToHistory = async (newProject: Project) => {
+    // Optimistic UI update
+    setHistory(prev => [newProject, ...prev]);
+    try {
+        await saveProject(newProject);
+        addLog("PROJECT ARCHIVED TO DB.");
+    } catch (e) {
+        console.error("Failed to save to DB", e);
+        addLog("ERROR: FAILED TO ARCHIVE PROJECT (STORAGE ERROR)");
+    }
   };
 
   const loadProject = (p: Project) => {
@@ -105,80 +114,86 @@ const Generator: React.FC = () => {
         setAssets(prev => [...prev, asset]);
     };
 
+    // Delay helper to prevent 429 Rate Limit errors
+    const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
     try {
-      // 1. Script
-      addLog("AGENT: WRITING PROPERTY SCRIPT");
+      // 1. Script Generation
+      addLog("AGENT: WRITING PROPERTY SCRIPT...");
       const scriptText = await generateScript(topic);
       const scriptAsset: GeneratedAsset = { id: crypto.randomUUID(), type: 'script', content: scriptText, status: 'success' };
       addAsset(scriptAsset);
       addLog("SCRIPT GENERATED.");
 
-      // Parallel Execution for visual and audio
+      // Throttling: Wait 1.5s
+      await wait(1500);
+
+      // 2. Audio Generation (Sequential)
+      setStep(GenerationStep.VOICING);
+      addLog("AGENT: TTS (KORE) - PROCESSING...");
+      try {
+         const audioUrl = await generateVoiceover(scriptText);
+         addAsset({ id: crypto.randomUUID(), type: 'audio', content: audioUrl, status: 'success' });
+         addLog("VOICEOVER COMPLETE.");
+      } catch (e) {
+         console.error(e);
+         addLog("ERROR: AUDIO GENERATION FAILED (Check Quota)");
+         addAsset({ id: crypto.randomUUID(), type: 'audio', content: '', status: 'error' });
+      }
+
+      // Throttling: Wait 1.5s
+      await wait(1500);
+
+      // 3. Thumbnail Generation (Sequential)
       setStep(GenerationStep.VISUALIZING);
-      addLog("DEPLOYING PARALLEL AGENTS: VISUAL + AUDIO");
+      addLog(`AGENT: IMAGEN - RENDERING 3D VIEW (${thumbStyle})...`);
+      try {
+        // If there's an uploaded image (thumbnail type), we could use it as reference,
+        // but for now we follow the standard generation path.
+        const thumbUrl = await generateThumbnail(topic, thumbStyle);
+        // Save topic in metadata for AssetCard overlay
+        addAsset({ 
+            id: crypto.randomUUID(), 
+            type: 'thumbnail', 
+            content: thumbUrl, 
+            status: 'success',
+            metadata: { topic: topic } 
+        });
+        addLog("THUMBNAIL RENDERED.");
+      } catch (e) {
+        console.error(e);
+        addLog("ERROR: THUMBNAIL FAILED (Check Quota)");
+        addAsset({ id: crypto.randomUUID(), type: 'thumbnail', content: '', status: 'error' });
+      }
 
-      const assetPromises: Promise<void>[] = [];
+      // Throttling: Wait 1.5s
+      await wait(1500);
 
-      // 2. Audio (Voiceover)
-      const audioPromise = (async () => {
-         try {
-             addLog("AGENT: TTS (KORE) - PROCESSING");
-             const audioUrl = await generateVoiceover(scriptText);
-             addAsset({ id: crypto.randomUUID(), type: 'audio', content: audioUrl, status: 'success' });
-             addLog("VOICEOVER COMPLETE.");
-         } catch (e) {
-             console.error(e);
-             addLog("ERROR: AUDIO GENERATION FAILED");
-             addAsset({ id: crypto.randomUUID(), type: 'audio', content: '', status: 'error' });
-         }
-      })();
-      assetPromises.push(audioPromise);
+      // 4. Video Generation (Sequential)
+      setStep(GenerationStep.FILMING);
+      addLog(`AGENT: VEO (${resolution}) - CREATING VIRTUAL TOUR...`);
+      try {
+        const videoUrl = await generateVeoVideo(topic, resolution);
+        addAsset({ id: crypto.randomUUID(), type: 'video', content: videoUrl, status: 'success' });
+        addLog("VIDEO SYNTHESIS COMPLETE.");
+      } catch (e) {
+        console.error(e);
+        addLog("ERROR: VEO FAILED (Check Quota)");
+        addAsset({ id: crypto.randomUUID(), type: 'video', content: '', status: 'error' });
+      }
 
-      // 3. Thumbnail
-      const thumbPromise = (async () => {
-          try {
-            addLog(`AGENT: IMAGEN - RENDERING 3D VIEW (${thumbStyle})`);
-            const thumbUrl = await generateThumbnail(topic, thumbStyle);
-            addAsset({ id: crypto.randomUUID(), type: 'thumbnail', content: thumbUrl, status: 'success' });
-            addLog("THUMBNAIL RENDERED.");
-          } catch (e) {
-            console.error(e);
-            addLog("ERROR: THUMBNAIL FAILED");
-            addAsset({ id: crypto.randomUUID(), type: 'thumbnail', content: '', status: 'error' });
-          }
-      })();
-      assetPromises.push(thumbPromise);
-
-      // 4. Video (Veo)
-      const videoPromise = (async () => {
-          try {
-            setStep(GenerationStep.FILMING);
-            addLog(`AGENT: VEO (${resolution}) - CREATING VIRTUAL TOUR`);
-            const videoUrl = await generateVeoVideo(topic, resolution);
-            addAsset({ id: crypto.randomUUID(), type: 'video', content: videoUrl, status: 'success' });
-            addLog("VIDEO SYNTHESIS COMPLETE.");
-          } catch (e) {
-            console.error(e);
-            addLog("ERROR: VEO FAILED");
-            addAsset({ id: crypto.randomUUID(), type: 'video', content: '', status: 'error' });
-          }
-      })();
-      assetPromises.push(videoPromise);
-
-      await Promise.all(assetPromises);
-      
+      // Finalization
       setStep(GenerationStep.COMPLETED);
       addLog("MISSION ACCOMPLISHED.");
 
-      // Save to History
+      // Save to History (IndexedDB)
       const newProject: Project = {
         id: crypto.randomUUID(),
         topic: topic,
         createdAt: Date.now(),
         assets: sessionAssets
       };
-      saveProjectToHistory(newProject);
-      addLog("PROJECT ARCHIVED.");
+      await saveProjectToHistory(newProject);
 
     } catch (error) {
       console.error(error);
